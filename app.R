@@ -1,0 +1,387 @@
+# ============================================================
+# admin_app.R — Admin GUI del banco de ítems (v3, identidad IEA)
+# ------------------------------------------------------------
+# UI con bslib (Bootstrap 5, paleta IEA). Banner con logo + título.
+# Navegación por botones (no tabs): "Editar/Borrar/Añadir" (con sidebar)
+# y "Cargar Excel" (sin sidebar). Versión con easter egg (10 clics -> iea.nl).
+#
+# Requisitos: el logo en  www/iea_logo.png  dentro del proyecto.
+# Variables de entorno:
+#   SUPABASE_HOST, SUPABASE_PORT, SUPABASE_DB, SUPABASE_ED_USER, SUPABASE_ED_PWD
+# ============================================================
+
+library(shiny)
+library(bslib)
+library(DBI)
+library(RPostgres)
+library(pool)
+library(DT)
+library(readxl)
+library(writexl)
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+APP_VERSION <- "1.0.1"
+IEA_RED  <- "#E2231A"
+IEA_GRAY <- "#54565A"
+
+# ------------------------------------------------------------
+# Conexión (rol de edición)
+# ------------------------------------------------------------
+pool <- dbPool(
+  RPostgres::Postgres(),
+  host = Sys.getenv("SUPABASE_HOST"), port = as.integer(Sys.getenv("SUPABASE_PORT")),
+  dbname = Sys.getenv("SUPABASE_DB"),
+  user = Sys.getenv("SUPABASE_ED_USER"), password = Sys.getenv("SUPABASE_ED_PWD"),
+  sslmode = "require"
+)
+onStop(function() poolClose(pool))
+
+# ============================================================
+# (1) METADATOS DEL MOTOR DE EDICIÓN
+# ============================================================
+fk  <- function(table, value, label = value) list(table = table, value = value, label = label)
+fld <- function(name, type = "text", required = FALSE, fk = NULL, pk = FALSE)
+  list(name = name, type = type, required = required, fk = fk, pk = pk)
+
+META <- list(
+  admin = list(pk = "admin_id", pk_generated = FALSE, fields = list(
+    fld("admin_id","text",TRUE,pk=TRUE), fld("study","text",TRUE), fld("phase"),
+    fld("year","smallint",TRUE), fld("instrument"), fld("target"), fld("cycle"))),
+  category = list(pk = "category_id", pk_generated = FALSE, fields = list(
+    fld("category_id","text",TRUE,pk=TRUE), fld("category_name","text",TRUE))),
+  item_id = list(pk = "item_uid", pk_generated = FALSE, fields = list(
+    fld("item_uid","text",TRUE,pk=TRUE), fld("item_name","text",TRUE),
+    fld("category_id","text",TRUE, fk=fk("category","category_id","category_name")))),
+  miss_scheme = list(pk = "miss_id", pk_generated = FALSE, fields = list(
+    fld("miss_id","text",TRUE,pk=TRUE))),
+  miss_scheme_value = list(pk = c("miss_id","value"), pk_generated = FALSE, fields = list(
+    fld("miss_id","text",TRUE,pk=TRUE, fk=fk("miss_scheme","miss_id")),
+    fld("value","smallint",TRUE,pk=TRUE), fld("category","text",TRUE))),
+  value_scheme = list(pk = "response_id", pk_generated = FALSE, fields = list(
+    fld("response_id","text",TRUE,pk=TRUE))),
+  value_scheme_value = list(pk = c("response_id","value"), pk_generated = FALSE, fields = list(
+    fld("response_id","text",TRUE,pk=TRUE, fk=fk("value_scheme","response_id")),
+    fld("value","smallint",TRUE,pk=TRUE), fld("label","text",TRUE))),
+  item_admin = list(pk = "item_admin_pk", pk_generated = TRUE, fields = list(
+    fld("item_admin_id","text",TRUE), fld("item_var","text",TRUE),
+    fld("admin_id","text",TRUE, fk=fk("admin","admin_id")),
+    fld("item_uid","text",TRUE, fk=fk("item_id","item_uid","item_name")),
+    fld("varname"), fld("dataset_label"), fld("wording_question"), fld("wording_item"),
+    fld("wording_instruction"), fld("wording_context"), fld("wording_heading"),
+    fld("type","text",TRUE), fld("miss_id","text", fk=fk("miss_scheme","miss_id")),
+    fld("response_id","text", fk=fk("value_scheme","response_id")), fld("puf","bool",TRUE))),
+  scale_uid = list(pk = "scale_id", pk_generated = FALSE, fields = list(
+    fld("scale_id","text",TRUE,pk=TRUE), fld("scale_description","text",TRUE))),
+  scale_items = list(pk = "scale_item_pk", pk_generated = TRUE, fields = list(
+    fld("scale_id","text",TRUE, fk=fk("scale_uid","scale_id","scale_description")),
+    fld("item_admin_pk","int",TRUE,
+        fk=fk("item_admin","item_admin_pk","item_admin_id || ' / ' || admin_id")),
+    fld("scale_varname","text",TRUE)))
+)
+
+cast_ph <- function(i, type) switch(type,
+                                    smallint=sprintf("$%d::smallint",i), int=sprintf("$%d::bigint",i),
+                                    bool=sprintf("$%d::boolean",i), sprintf("$%d",i))
+fk_choices <- function(f) {
+  d <- dbGetQuery(pool, sprintf("select %s as v, %s as l from %s order by l", f$value, f$label, f$table))
+  setNames(as.character(d$v), d$l)
+}
+make_input <- function(f, value = NULL, mode = "add") {
+  id <- paste0("fld_", f$name)
+  if (mode == "edit" && isTRUE(f$pk)) return(tags$p(tags$strong(f$name), ": ", value %||% ""))
+  if (!is.null(f$fk)) selectizeInput(id, f$name, choices = c("", fk_choices(f$fk)), selected = as.character(value %||% ""))
+  else if (f$type == "bool") checkboxInput(id, f$name, value = isTRUE(as.logical(value)))
+  else if (f$type %in% c("smallint","int")) numericInput(id, f$name, value = if (is.null(value)) NA else as.numeric(value))
+  else textInput(id, f$name, value = as.character(value %||% ""))
+}
+read_input <- function(input, f) {
+  if (f$type == "bool") return(as.character(isTRUE(input[[paste0("fld_", f$name)]])))
+  v <- input[[paste0("fld_", f$name)]]
+  if (is.null(v) || (is.character(v) && !nzchar(v)) || (is.numeric(v) && is.na(v))) NA_character_ else as.character(v)
+}
+
+# ============================================================
+# (2) CARGADOR EXCEL (8 hojas)
+# ============================================================
+sh <- function(cols, required, int = character(), bool = character())
+  list(cols = cols, required = required, int = int, bool = bool)
+SHEET_SPEC <- list(
+  admin = sh(c("admin_id","study","phase","year","instrument","target","cycle"), c("admin_id","study","year"), int="year"),
+  category = sh(c("category_id","category_name"), c("category_id","category_name")),
+  item_id = sh(c("item_uid","item_name","category_id"), c("item_uid","item_name","category_id")),
+  item_admin = sh(c("item_admin_id","item_var","admin_id","item_uid","varname","dataset_label",
+                    "wording_question","wording_item","wording_instruction","wording_context",
+                    "wording_heading","type","miss_id","response_id","puf"),
+                  c("item_admin_id","item_var","admin_id","item_uid","type","puf"), bool="puf"),
+  miss_scheme = sh(c("miss_id","value","category"), c("miss_id","value","category"), int="value"),
+  value_scheme = sh(c("response_id","value","label"), c("response_id","value","label"), int="value"),
+  scale_uid = sh(c("scale_id","scale_description"), c("scale_id","scale_description")),
+  scale_items = sh(c("scale_id","item_admin_id","id_admin","scale_varname"), c("scale_id","item_admin_id","id_admin","scale_varname"))
+)
+validate_upload <- function(path) {
+  errs <- character(); data <- list()
+  sheets <- readxl::excel_sheets(path)
+  unknown <- setdiff(sheets, names(SHEET_SPEC))
+  if (length(unknown)) errs <- c(errs, paste("Unrecognized sheets:", paste(unknown, collapse=", ")))
+  for (s in intersect(sheets, names(SHEET_SPEC))) {
+    df <- readxl::read_excel(path, sheet = s); spec <- SHEET_SPEC[[s]]
+    miss_cols <- setdiff(spec$required, names(df))
+    if (length(miss_cols)) { errs <- c(errs, sprintf("%s: required columns are missing: %s", s, paste(miss_cols, collapse=", "))); next }
+    for (rc in spec$required) { col <- df[[rc]]
+    if (any(is.na(col) | (is.character(col) & !nzchar(trimws(col))))) errs <- c(errs, sprintf("%s: the required column ‘%s’ contains empty cells", s, rc)) }
+    for (ic in spec$int) if (ic %in% names(df)) { v <- suppressWarnings(as.integer(as.character(df[[ic]])))
+    if (any(is.na(v) & !is.na(df[[ic]]))) errs <- c(errs, sprintf("%s: '%s' contains values that are not integers", s, ic)) }
+    for (bc in spec$bool) if (bc %in% names(df)) { norm <- tolower(trimws(as.character(df[[bc]])))
+    if (!all(norm %in% c("true","false","t","f","1","0","yes","no","si","sí","na",""))) errs <- c(errs, sprintf("%s: '%s' is not Boolean (use TRUE/FALSE)", s, bc)) }
+    data[[s]] <- df
+  }
+  list(errors = errs, data = data)
+}
+to_staging <- function(df, spec) {
+  df <- as.data.frame(lapply(df, as.character), stringsAsFactors = FALSE)
+  for (bc in spec$bool) if (bc %in% names(df)) { n <- tolower(trimws(df[[bc]]))
+  df[[bc]] <- ifelse(n %in% c("true","t","1","yes","si","sí"), "true", ifelse(n %in% c("false","f","0","no"), "false", NA)) }
+  df
+}
+do_load <- function(data, modified_by) {
+  con <- poolCheckout(pool); on.exit(poolReturn(con))
+  mb <- dbQuoteLiteral(con, modified_by); present <- names(data)
+  stg <- paste0("stg_", names(SHEET_SPEC))
+  for (t in stg) dbExecute(con, sprintf("drop table if exists %s", t))
+  tryCatch({
+    for (s in present) dbWriteTable(con, paste0("stg_", s), to_staging(data[[s]], SHEET_SPEC[[s]]), temporary = TRUE, overwrite = TRUE)
+    dbBegin(con); run <- function(sql) dbExecute(con, sql); has <- function(s) s %in% present
+    if (has("admin")) run(sprintf("insert into admin (admin_id,study,phase,year,instrument,target,cycle,modified_by) select admin_id,study,phase,year::smallint,instrument,target,cycle,%s from stg_admin", mb))
+    if (has("category")) run(sprintf("insert into category (category_id,category_name,modified_by) select category_id,category_name,%s from stg_category", mb))
+    if (has("item_id")) run(sprintf("insert into item_id (item_uid,item_name,category_id,modified_by) select item_uid,item_name,category_id,%s from stg_item_id", mb))
+    if (has("miss_scheme")) { run(sprintf("insert into miss_scheme (miss_id,modified_by) select distinct miss_id,%s from stg_miss_scheme on conflict (miss_id) do nothing", mb))
+      run(sprintf("insert into miss_scheme_value (miss_id,value,category,modified_by) select miss_id,value::smallint,category,%s from stg_miss_scheme", mb)) }
+    if (has("value_scheme")) { run(sprintf("insert into value_scheme (response_id,modified_by) select distinct response_id,%s from stg_value_scheme on conflict (response_id) do nothing", mb))
+      run(sprintf("insert into value_scheme_value (response_id,value,label,modified_by) select response_id,value::smallint,label,%s from stg_value_scheme", mb)) }
+    if (has("item_admin")) run(sprintf("insert into item_admin (item_admin_id,item_var,admin_id,item_uid,varname,dataset_label,wording_question,wording_item,wording_instruction,wording_context,wording_heading,type,miss_id,response_id,puf,modified_by) select item_admin_id,item_var,admin_id,item_uid,varname,dataset_label,wording_question,wording_item,wording_instruction,wording_context,wording_heading,type,miss_id,response_id,puf::boolean,%s from stg_item_admin", mb))
+    if (has("scale_uid")) run(sprintf("insert into scale_uid (scale_id,scale_description,modified_by) select scale_id,scale_description,%s from stg_scale_uid", mb))
+    if (has("scale_items")) {
+      run("do $$ declare n int; begin select count(*) into n from stg_scale_items s left join item_admin ia on ia.item_admin_id=s.item_admin_id and ia.admin_id=s.id_admin where ia.item_admin_pk is null; if n > 0 then raise exception 'scale_items: % fila(s) referencian un item administrado inexistente', n; end if; end $$;")
+      run(sprintf("insert into scale_items (scale_id,item_admin_pk,scale_varname,modified_by) select s.scale_id, ia.item_admin_pk, s.scale_varname, %s from stg_scale_items s join item_admin ia on ia.item_admin_id=s.item_admin_id and ia.admin_id=s.id_admin", mb)) }
+    dbCommit(con)
+    for (t in stg) dbExecute(con, sprintf("drop table if exists %s", t))
+    list(ok = TRUE, rows = vapply(data, nrow, integer(1)))
+  }, error = function(e) {
+    try(dbRollback(con), silent = TRUE)
+    for (t in stg) try(dbExecute(con, sprintf("drop table if exists %s", t)), silent = TRUE)
+    list(ok = FALSE, msg = conditionMessage(e))
+  })
+}
+template_workbook <- function() lapply(SHEET_SPEC, function(s) { df <- as.data.frame(matrix(character(), nrow = 0, ncol = length(s$cols))); names(df) <- s$cols; df })
+
+# ============================================================
+# TEMA Y ESTILOS (paleta IEA)
+# ============================================================
+iea_theme <- bs_theme(version = 5, primary = IEA_RED, secondary = IEA_GRAY)
+
+iea_css <- sprintf("
+:root { --iea-red:%s; --iea-gray:%s; }
+.iea-banner{ position:relative; display:flex; align-items:center; justify-content:center;
+  padding:14px 24px; background:#fff; border-bottom:4px solid var(--iea-red); margin-bottom:4px; }
+.iea-logo{ position:absolute; left:24px; height:54px; }
+.iea-title{ font-size:1.6rem; font-weight:700; color:var(--iea-gray); text-align:center; letter-spacing:.3px; }
+.iea-version{ position:absolute; right:24px; bottom:10px; font-size:.78rem; color:#9a9a9a; cursor:pointer; user-select:none; }
+.iea-nav{ display:flex; gap:14px; justify-content:center; margin:18px 0 22px; flex-wrap:wrap; }
+.iea-navbtn{ border:2px solid var(--iea-gray); background:#fff; color:var(--iea-gray);
+  font-weight:600; padding:12px 24px; border-radius:12px; transition:all .15s; }
+.iea-navbtn:hover{ border-color:var(--iea-red); color:var(--iea-red); }
+.iea-navbtn.active{ background:var(--iea-red); border-color:var(--iea-red); color:#fff; }
+.iea-navbtn .fa, .iea-navbtn .fas{ margin-right:8px; }
+.editor-bar{ max-width:460px; margin:0 auto 10px; }
+.editor-bar .form-group{ margin-bottom:4px; }
+", IEA_RED, IEA_GRAY)
+
+iea_js <- "
+(function(){
+  // Navegación: marca el botón activo (cliente)
+  function wire(){
+    var btns = document.querySelectorAll('.iea-navbtn');
+    btns.forEach(function(b){ b.addEventListener('click', function(){
+      btns.forEach(function(x){ x.classList.remove('active'); });
+      this.classList.add('active');
+    }); });
+    var v = document.getElementById('app-version'); var c = 0;
+    if (v) v.addEventListener('click', function(){ if (++c >= 10) { window.open('https://www.iea.nl','_blank'); c = 0; } });
+  }
+  if (document.readyState !== 'loading') wire(); else document.addEventListener('DOMContentLoaded', wire);
+})();
+"
+
+# ============================================================
+# UI
+# ============================================================
+ui <- page_fluid(
+  theme = iea_theme,
+  tags$head(tags$style(HTML(iea_css))),
+  
+  # --- Banner ---
+  div(class = "iea-banner",
+      img(src = "iea_logo.png", class = "iea-logo", alt = "IEA"),
+      div(class = "iea-title", "Item Bank · Administration"),
+      div(class = "iea-version", id = "app-version", paste0("version ", APP_VERSION))
+  ),
+  
+  # --- Barra de autor (provisional, sin portal) ---
+  div(class = "editor-bar",
+      div(style = "color:var(--iea-red);font-weight:600;font-size:.85rem;text-align:center;",
+          "No login yet: indicates who made the changes"),
+      textInput("modified_by", NULL, value = "", placeholder = "Editor (modified_by)", width = "100%")
+  ),
+  
+  # --- Navegación por botones ---
+  div(class = "iea-nav",
+      actionButton("nav_edit", tagList(icon("table"), "Edit / Delete / Add"), class = "iea-navbtn active"),
+      actionButton("nav_load", tagList(icon("upload"), "Upload Excel"), class = "iea-navbtn")
+  ),
+  
+  # --- Paneles (navset oculto; se cambia con los botones) ---
+  navset_hidden(
+    id = "mode",
+    nav_panel("edit",
+              layout_sidebar(
+                sidebar = sidebar(title = "Actions", width = 280,
+                                  selectInput("table", "Table", choices = names(META)),
+                                  actionButton("add", "Add row", icon = icon("plus"), class = "btn-primary w-100"),
+                                  actionButton("edit", "Edit Selected", icon = icon("pen"), class = "w-100"),
+                                  actionButton("del", "Delete Selected", icon = icon("trash"), class = "btn-outline-danger w-100")
+                ),
+                card(card_header(textOutput("table_title")), DTOutput("grid"))
+              )
+    ),
+    nav_panel("load",
+              card(
+                card_header(" Massive upload via Excel"),
+                downloadButton("dl_template", "Download template (8 sheets)", class = "btn-outline-secondary"),
+                hr(),
+                fileInput("xlsx", "Upload the Excel file (mass upload)", accept = ".xlsx", width = "100%"),
+                uiOutput("load_ui")
+              )
+    )
+  ),
+  tags$script(HTML(iea_js))
+)
+
+# ============================================================
+# SERVER
+# ============================================================
+server <- function(input, output, session) {
+  
+  # --- Navegación ---
+  observeEvent(input$nav_edit, nav_select("mode", "edit"))
+  observeEvent(input$nav_load, nav_select("mode", "load"))
+  
+  refresh <- reactiveVal(0)
+  meta <- reactive(META[[input$table]])
+  table_data <- reactive({ refresh(); dbGetQuery(pool, sprintf("select * from %s", input$table)) })
+  
+  output$grid <- renderDT({
+    datatable(table_data(), selection = "single", rownames = FALSE, filter = "top",
+              options = list(dom = "t", scrollX = TRUE, paging = FALSE, scrollY     = "65vh", scrollCollapse = TRUE))
+  }, server = TRUE)
+  
+  output$table_title <- renderText({
+    paste("Editing table:", input$table)
+  })
+  
+  selected_row <- reactive({
+    sel <- input$grid_rows_selected
+    if (is.null(sel)) return(NULL)
+    as.list(table_data()[sel, , drop = FALSE])
+  })
+  
+  require_author <- function() {
+    if (!nzchar(input$modified_by %||% "")) {
+      showModal(modalDialog("Enter who is uploading the file (the “Editor” field).", easyClose = TRUE, footer = modalButton("Close")))
+      return(FALSE)
+    }
+    TRUE
+  }
+  
+  show_form <- function(mode) {
+    m <- meta(); row <- if (mode == "edit") selected_row() else NULL
+    inputs <- lapply(m$fields, function(f) make_input(f, value = if (!is.null(row)) row[[f$name]] else NULL, mode = mode))
+    showModal(modalDialog(title = paste(if (mode == "edit") "Editar" else "Añadir", input$table),
+                          do.call(tagList, inputs),
+                          footer = tagList(modalButton("Cancel"), actionButton("save", "Save", class = "btn-primary")), easyClose = FALSE))
+    session$userData$mode <- mode
+  }
+  
+  observeEvent(input$add,  if (require_author()) show_form("add"))
+  observeEvent(input$edit, {
+    if (is.null(selected_row())) showModal(modalDialog("Select a row first.", easyClose = TRUE, footer = modalButton("Close")))
+    else if (require_author()) show_form("edit")
+  })
+  
+  observeEvent(input$save, {
+    m <- meta(); mode <- session$userData$mode
+    writable <- Filter(function(f) if (mode == "add") !(m$pk_generated && isTRUE(f$pk)) else !isTRUE(f$pk), m$fields)
+    missing <- Filter(function(f) f$required && is.na(read_input(input, f)), writable)
+    if (length(missing)) { showModal(modalDialog(paste("Required columns are missing:", paste(vapply(missing, `[[`, "", "name"), collapse = ", ")), easyClose = TRUE, footer = modalButton("Close"))); return() }
+    cols <- vapply(writable, `[[`, "", "name"); vals <- vapply(writable, function(f) read_input(input, f), "")
+    result <- tryCatch({
+      if (mode == "add") {
+        casts <- vapply(seq_along(writable), function(i) cast_ph(i, writable[[i]]$type), "")
+        sql <- sprintf("insert into %s (%s, modified_by) values (%s, $%d)", input$table, paste(cols, collapse = ", "), paste(casts, collapse = ", "), length(writable) + 1)
+        dbExecute(pool, sql, params = unname(c(as.list(vals), input$modified_by)))
+      } else {
+        sets <- vapply(seq_along(writable), function(i) sprintf("%s = %s", cols[i], cast_ph(i, writable[[i]]$type)), "")
+        nset <- length(writable); pk <- m$pk
+        where <- paste(sprintf("%s = $%d", pk, nset + 1 + seq_along(pk)), collapse = " and ")
+        sql <- sprintf("update %s set %s, modified_by = $%d where %s", input$table, paste(sets, collapse = ", "), nset + 1, where)
+        pkvals <- vapply(pk, function(p) as.character(selected_row()[[p]]), "")
+        dbExecute(pool, sql, params = unname(c(as.list(vals), input$modified_by, as.list(pkvals))))
+      }; "ok"
+    }, error = function(e) conditionMessage(e))
+    if (identical(result, "ok")) { removeModal(); refresh(refresh() + 1) }
+    else showModal(modalDialog(title = "Unable to save", tags$pre(result), easyClose = TRUE, footer = modalButton("Close")))
+  })
+  
+  observeEvent(input$del, {
+    if (is.null(selected_row())) { showModal(modalDialog("Select a row first.", easyClose = TRUE, footer = modalButton("Close"))); return() }
+    if (!require_author()) return()
+    showModal(modalDialog(title = "Confirm removal", "Delete the selected row? This action cannot be undone.",
+                          footer = tagList(modalButton("Cancel"), actionButton("del_confirm", "Delete", class = "btn-danger"))))
+  })
+  
+  observeEvent(input$del_confirm, {
+    m <- meta(); pk <- m$pk
+    where <- paste(sprintf("%s = $%d", pk, seq_along(pk)), collapse = " and ")
+    pkvals <- vapply(pk, function(p) as.character(selected_row()[[p]]), "")
+    result <- tryCatch({ dbExecute(pool, sprintf("delete from %s where %s", input$table, where), params = unname(as.list(pkvals))); "ok" },
+                       error = function(e) conditionMessage(e))
+    removeModal()
+    if (identical(result, "ok")) refresh(refresh() + 1)
+    else showModal(modalDialog(title = "It wasn't possible to delete it", "The table probably has associated records (foreign keys).", tags$pre(result), easyClose = TRUE, footer = modalButton("Close")))
+  })
+  
+  # --- Cargador Excel ---
+  output$dl_template <- downloadHandler(
+    filename = function() "plantilla_carga.xlsx",
+    content  = function(file) writexl::write_xlsx(template_workbook(), file))
+  
+  upload <- reactiveVal(NULL)
+  observeEvent(input$xlsx, upload(validate_upload(input$xlsx$datapath)))
+  
+  output$load_ui <- renderUI({
+    u <- upload(); if (is.null(u)) return(NULL)
+    if (length(u$errors)) tagList(div(class = "text-danger fw-bold", "Nothing will be loaded: fix the Excel file."), tags$ul(lapply(u$errors, tags$li)))
+    else { resumen <- paste(sprintf("%s: %d fila(s)", names(u$data), vapply(u$data, nrow, integer(1))), collapse = " · ")
+    tagList(div(class = "text-success", paste("Valid Excel file.", resumen)), actionButton("do_load", "Upload to the database", class = "btn-primary")) }
+  })
+  
+  observeEvent(input$do_load, {
+    if (!nzchar(input$modified_by %||% "")) { showModal(modalDialog("Enter who is uploading the file (the “Editor” field).", easyClose = TRUE, footer = modalButton("Close"))); return() }
+    u <- upload(); res <- do_load(u$data, input$modified_by)
+    if (isTRUE(res$ok)) {
+      showModal(modalDialog(title = "Upload complete", paste(sprintf("%s: +%d", names(res$rows), res$rows), collapse = " · "), easyClose = TRUE, footer = modalButton("Close")))
+      upload(NULL); refresh(refresh() + 1)
+    } else showModal(modalDialog(title = "Returned data (no rows were added)", tags$pre(res$msg), easyClose = TRUE, footer = modalButton("Close")))
+  })
+}
+
+shinyApp(ui, server)
