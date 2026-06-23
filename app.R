@@ -18,6 +18,8 @@ library(pool)
 library(DT)
 library(readxl)
 library(writexl)
+library(httr2)
+library(jsonlite)
 
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
 APP_VERSION <- "1.0.1"
@@ -35,6 +37,82 @@ pool <- dbPool(
   sslmode = "require"
 )
 onStop(function() poolClose(pool))
+
+SUPABASE_URL <- Sys.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY <- Sys.getenv("SUPABASE_ANON_KEY")
+
+supabase_sign_in <- function(email, password) {
+  
+  req <- request(
+    paste0(
+      SUPABASE_URL,
+      "/auth/v1/token?grant_type=password"
+    )
+  ) |>
+    req_method("POST") |>
+    req_headers(
+      apikey = SUPABASE_ANON_KEY,
+      Authorization = paste("Bearer", SUPABASE_ANON_KEY)
+    ) |>
+    req_body_json(list(
+      email = email,
+      password = password
+    ))
+  
+  resp <- tryCatch(
+    req_perform(req),
+    error = function(e) NULL
+  )
+  
+  if (is.null(resp) || resp_status(resp) >= 400) {
+    return(NULL)
+  }
+  
+  resp_body_json(resp)
+}
+
+supabase_update_password <- function(access_token, new_password) {
+  
+  req <- request(
+    paste0(SUPABASE_URL, "/auth/v1/user")
+  ) |>
+    req_method("PUT") |>
+    req_headers(
+      apikey = SUPABASE_ANON_KEY,
+      Authorization = paste("Bearer", access_token),
+      `Content-Type` = "application/json"
+    ) |>
+    req_body_raw(
+      jsonlite::toJSON(
+        list(password = new_password),
+        auto_unbox = TRUE
+      )
+    )
+  
+  resp <- tryCatch(
+    req_perform(req),
+    error = function(e) NULL
+  )
+  
+  !is.null(resp) && resp_status(resp) < 400
+}
+
+get_user_profile <- function(user_id) {
+  dbGetQuery(
+    pool,
+    "
+    select
+      user_id,
+      first_name,
+      last_name,
+      role,
+      active
+    from public.user_profiles
+    where user_id = $1
+    ",
+    params = list(user_id)
+  )
+}
 
 # ============================================================
 # (1) METADATOS DEL MOTOR DE EDICIÓN
@@ -212,57 +290,183 @@ iea_js <- "
 })();
 "
 
+login_ui <- function() {
+  div(
+    style = "
+      max-width: 420px;
+      margin: 90px auto;
+      padding: 32px;
+      border: 1px solid #ddd;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: 0 2px 10px rgba(0,0,0,.08);
+    ",
+    
+    div(
+      style = "text-align:center; margin-bottom:24px;",
+      img(src = "iea_logo.png", style = "height:52px; margin-bottom:14px;"),
+      div(
+        style = "font-size:1.4rem; font-weight:700; color:#54565A;",
+        "IEABank Portal"
+      )
+    ),
+    
+    textInput(
+      "login_email",
+      "Email",
+      placeholder = "name@example.org"
+    ),
+    
+    passwordInput(
+      "login_password",
+      "Password"
+    ),
+    
+    actionButton(
+      "login_btn",
+      "Sign in",
+      class = "btn-primary w-100"
+    ),
+    
+    uiOutput("login_message")
+  )
+}
+
+
+portal_ui <- function() {
+  tagList(
+    
+    # --- Banner ---
+    div(
+      class = "iea-banner",
+      img(src = "iea_logo.png", class = "iea-logo", alt = "IEA"),
+      div(class = "iea-title", "Item Bank · Administration"),
+      div(
+        class = "iea-version",
+        id = "app-version",
+        paste0("version ", APP_VERSION)
+      )
+    ),
+    
+    # --- Usuario autenticado ---
+    div(
+      class = "editor-bar",
+      textOutput("logged_user")
+    ),
+    
+    # --- Navegación ---
+    div(
+      class = "iea-nav",
+      actionButton(
+        "nav_edit",
+        tagList(icon("table"), "Edit / Delete / Add"),
+        class = "iea-navbtn active"
+      ),
+      
+      actionButton(
+        "nav_load",
+        tagList(icon("upload"), "Upload Excel"),
+        class = "iea-navbtn"
+      ),
+      
+      actionButton(
+        "change_password_btn",
+        tagList(icon("key"), "Change password"),
+        class = "iea-navbtn"
+      ),
+      
+      actionButton(
+        "logout_btn",
+        tagList(icon("sign-out-alt"), "Sign out"),
+        class = "iea-navbtn"
+      )
+    ),
+    
+    # --- Paneles ---
+    navset_hidden(
+      id = "mode",
+      
+      nav_panel(
+        "edit",
+        layout_sidebar(
+          sidebar = sidebar(
+            title = "Actions",
+            width = 280,
+            
+            selectInput(
+              "table",
+              "Table",
+              choices = names(META)
+            ),
+            
+            div(
+              style = "display:flex; flex-direction:column; gap:8px;",
+              
+              actionButton(
+                "add",
+                "Add row",
+                icon = icon("plus"),
+                class = "btn-primary w-100"
+              ),
+              
+              actionButton(
+                "edit",
+                "Edit Selected",
+                icon = icon("pen"),
+                class = "w-100"
+              ),
+              
+              actionButton(
+                "del",
+                "Delete Selected",
+                icon = icon("trash"),
+                class = "btn-outline-danger w-100"
+              )
+            )
+          ),
+          
+          card(
+            card_header(textOutput("table_title")),
+            DTOutput("grid")
+          )
+        )
+      ),
+      
+      nav_panel(
+        "load",
+        card(
+          card_header("Massive upload via Excel"),
+          downloadButton(
+            "dl_template",
+            "Download template (8 sheets)",
+            class = "btn-outline-secondary"
+          ),
+          hr(),
+          fileInput(
+            "xlsx",
+            "Upload the Excel file (mass upload)",
+            accept = ".xlsx",
+            width = "100%"
+          ),
+          uiOutput("load_ui")
+        )
+      )
+    )
+  )
+}
+
 # ============================================================
 # UI
 # ============================================================
 ui <- page_fluid(
   theme = iea_theme,
-  tags$head(tags$style(HTML(iea_css))),
   
-  # --- Banner ---
-  div(class = "iea-banner",
-      img(src = "iea_logo.png", class = "iea-logo", alt = "IEA"),
-      div(class = "iea-title", "Item Bank · Administration"),
-      div(class = "iea-version", id = "app-version", paste0("version ", APP_VERSION))
+  tags$head(
+    tags$style(HTML(iea_css))
   ),
   
-  # --- Barra de autor (provisional, sin portal) ---
-  div(class = "editor-bar",
-      div(style = "color:var(--iea-red);font-weight:600;font-size:.85rem;text-align:center;",
-          "No login yet: indicates who made the changes"),
-      textInput("modified_by", NULL, value = "", placeholder = "Editor (modified_by)", width = "100%")
-  ),
+  uiOutput("app_ui"),
   
-  # --- Navegación por botones ---
-  div(class = "iea-nav",
-      actionButton("nav_edit", tagList(icon("table"), "Edit / Delete / Add"), class = "iea-navbtn active"),
-      actionButton("nav_load", tagList(icon("upload"), "Upload Excel"), class = "iea-navbtn")
-  ),
-  
-  # --- Paneles (navset oculto; se cambia con los botones) ---
-  navset_hidden(
-    id = "mode",
-    nav_panel("edit",
-              layout_sidebar(
-                sidebar = sidebar(title = "Actions", width = 280,
-                                  selectInput("table", "Table", choices = names(META)),
-                                  actionButton("add", "Add row", icon = icon("plus"), class = "btn-primary w-100"),
-                                  actionButton("edit", "Edit Selected", icon = icon("pen"), class = "w-100"),
-                                  actionButton("del", "Delete Selected", icon = icon("trash"), class = "btn-outline-danger w-100")
-                ),
-                card(card_header(textOutput("table_title")), DTOutput("grid"))
-              )
-    ),
-    nav_panel("load",
-              card(
-                card_header(" Massive upload via Excel"),
-                downloadButton("dl_template", "Download template (8 sheets)", class = "btn-outline-secondary"),
-                hr(),
-                fileInput("xlsx", "Upload the Excel file (mass upload)", accept = ".xlsx", width = "100%"),
-                uiOutput("load_ui")
-              )
-    )
-  ),
   tags$script(HTML(iea_js))
 )
 
@@ -270,6 +474,172 @@ ui <- page_fluid(
 # SERVER
 # ============================================================
 server <- function(input, output, session) {
+  
+  current_user <- reactiveVal(NULL)
+  login_error <- reactiveVal(NULL)
+  
+  current_auth <- reactiveVal(NULL)
+  
+  output$app_ui <- renderUI({
+    if (is.null(current_user())) {
+      login_ui()
+    } else {
+      portal_ui()
+    }
+  })
+  
+  output$login_message <- renderUI({
+    req(login_error())
+    
+    div(
+      class = "text-danger",
+      style = "margin-top:14px; text-align:center;",
+      login_error()
+    )
+  })
+  
+  observeEvent(input$login_btn, {
+    
+    login_error(NULL)
+    
+    email <- trimws(input$login_email %||% "")
+    password <- input$login_password %||% ""
+    
+    if (!nzchar(email) || !nzchar(password)) {
+      login_error("Enter your email and password.")
+      return()
+    }
+    
+    auth <- supabase_sign_in(email, password)
+    
+    if (is.null(auth) || is.null(auth$user$id)) {
+      login_error("Invalid email or password.")
+      return()
+    }
+    
+    profile <- get_user_profile(auth$user$id)
+    
+    if (nrow(profile) != 1) {
+      login_error("This account has no IEABank profile.")
+      return()
+    }
+    
+    if (!isTRUE(profile$active[1])) {
+      login_error("This account is inactive. Contact an administrator.")
+      return()
+    }
+    
+    current_user(as.list(profile[1, ]))
+    
+    current_auth(auth)
+  })
+  
+  observeEvent(input$change_password_btn, {
+    
+    showModal(
+      modalDialog(
+        title = "Change password",
+        
+        passwordInput(
+          "new_password",
+          "New password"
+        ),
+        
+        passwordInput(
+          "new_password_confirm",
+          "Confirm new password"
+        ),
+        
+        footer = tagList(
+          modalButton("Cancel"),
+          actionButton(
+            "save_password_btn",
+            "Update password",
+            class = "btn-primary"
+          )
+        ),
+        easyClose = FALSE
+      )
+    )
+  })
+  
+  observeEvent(input$save_password_btn, {
+    
+    new_password <- input$new_password %||% ""
+    confirm_password <- input$new_password_confirm %||% ""
+    
+    if (nchar(new_password) < 8) {
+      showNotification(
+        "Your password must contain at least 8 characters.",
+        type = "error"
+      )
+      return()
+    }
+    
+    if (!identical(new_password, confirm_password)) {
+      showNotification(
+        "The passwords do not match.",
+        type = "error"
+      )
+      return()
+    }
+    
+    auth <- current_auth()
+    
+    if (is.null(auth) || is.null(auth$access_token)) {
+      showNotification(
+        "Your session has expired. Please sign in again.",
+        type = "error"
+      )
+      return()
+    }
+    
+    ok <- supabase_update_password(
+      access_token = auth$access_token,
+      new_password = new_password
+    )
+    
+    if (ok) {
+      removeModal()
+      showNotification(
+        "Password updated successfully.",
+        type = "message"
+      )
+    } else {
+      showNotification(
+        "It was not possible to update the password. Please sign in again and retry.",
+        type = "error"
+      )
+    }
+  })
+  
+  observeEvent(input$logout_btn, {
+    current_user(NULL)
+    current_auth(NULL)
+    login_error(NULL)
+  })
+  
+  current_user_name <- reactive({
+    user <- current_user()
+    req(user)
+    
+    paste(user$first_name, user$last_name)
+  })
+  
+  output$logged_user <- renderText({
+    user <- current_user()
+    req(user)
+    
+    paste0(
+      "Signed in as: ",
+      user$first_name,
+      " ",
+      user$last_name,
+      " (",
+      user$role,
+      ")"
+    )
+  })
   
   # --- Navegación ---
   observeEvent(input$nav_edit, nav_select("mode", "edit"))
@@ -295,10 +665,19 @@ server <- function(input, output, session) {
   })
   
   require_author <- function() {
-    if (!nzchar(input$modified_by %||% "")) {
-      showModal(modalDialog("Enter who is uploading the file (the “Editor” field).", easyClose = TRUE, footer = modalButton("Close")))
+    user <- current_user()
+    
+    if (is.null(user) || !isTRUE(user$active)) {
+      showModal(
+        modalDialog(
+          "Your session is no longer active. Please sign in again.",
+          easyClose = TRUE,
+          footer = modalButton("Close")
+        )
+      )
       return(FALSE)
     }
+    
     TRUE
   }
   
@@ -327,14 +706,14 @@ server <- function(input, output, session) {
       if (mode == "add") {
         casts <- vapply(seq_along(writable), function(i) cast_ph(i, writable[[i]]$type), "")
         sql <- sprintf("insert into %s (%s, modified_by) values (%s, $%d)", input$table, paste(cols, collapse = ", "), paste(casts, collapse = ", "), length(writable) + 1)
-        dbExecute(pool, sql, params = unname(c(as.list(vals), input$modified_by)))
+        dbExecute(pool, sql, params = unname(c(as.list(vals), current_user_name())))
       } else {
         sets <- vapply(seq_along(writable), function(i) sprintf("%s = %s", cols[i], cast_ph(i, writable[[i]]$type)), "")
         nset <- length(writable); pk <- m$pk
         where <- paste(sprintf("%s = $%d", pk, nset + 1 + seq_along(pk)), collapse = " and ")
         sql <- sprintf("update %s set %s, modified_by = $%d where %s", input$table, paste(sets, collapse = ", "), nset + 1, where)
         pkvals <- vapply(pk, function(p) as.character(selected_row()[[p]]), "")
-        dbExecute(pool, sql, params = unname(c(as.list(vals), input$modified_by, as.list(pkvals))))
+        dbExecute(pool, sql, params = unname(c(as.list(vals), current_user_name(), as.list(pkvals))))
       }; "ok"
     }, error = function(e) conditionMessage(e))
     if (identical(result, "ok")) { removeModal(); refresh(refresh() + 1) }
@@ -375,8 +754,9 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$do_load, {
-    if (!nzchar(input$modified_by %||% "")) { showModal(modalDialog("Enter who is uploading the file (the “Editor” field).", easyClose = TRUE, footer = modalButton("Close"))); return() }
-    u <- upload(); res <- do_load(u$data, input$modified_by)
+    if (!require_author()) return()
+    u <- upload()
+    res <- do_load(u$data, current_user_name())
     if (isTRUE(res$ok)) {
       showModal(modalDialog(title = "Upload complete", paste(sprintf("%s: +%d", names(res$rows), res$rows), collapse = " · "), easyClose = TRUE, footer = modalButton("Close")))
       upload(NULL); refresh(refresh() + 1)

@@ -2012,13 +2012,16 @@
   },
   "files": {
     ".Renviron": {
-      "checksum": "8897c026385ab0089513047da307b652"
+      "checksum": "6a7bd078e54ba207d7068177facedc81"
     },
     ".Rprofile": {
-      "checksum": "93d75ce9d8ac3809cead2a29c9102e95"
+      "checksum": "932f11ec9592fbd6438b18bbbcd60ed8"
+    },
+    "app - Copy.R": {
+      "checksum": "d3671f559f48ab0a9362870af47bec06"
     },
     "app.R": {
-      "checksum": "24ad9dfca6f2954771d0e2d9a11b8346"
+      "checksum": "2341ccfd9af8792c53dae5458caf349d"
     },
     "renv.lock": {
       "checksum": "d56b6263b1148b20339add7f7ecbd299"
