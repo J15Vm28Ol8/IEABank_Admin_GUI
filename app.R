@@ -116,6 +116,8 @@ supabase_send_password_reset <- function(email) {
       email = email
     ))
   
+  print(req$url)
+  
   resp <- tryCatch(
     req_perform(req),
     error = function(e) NULL
