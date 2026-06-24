@@ -116,7 +116,6 @@ supabase_send_password_reset <- function(email) {
       email = email
     ))
   
-  print(req$url)
   
   resp <- tryCatch(
     req_perform(req),
@@ -580,7 +579,6 @@ server <- function(input, output, session) {
       error = function(e) list(status = NA, body = conditionMessage(e))
     )
     
-    print(res)
     
     removeModal()
     
