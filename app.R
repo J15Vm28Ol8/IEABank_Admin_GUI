@@ -104,22 +104,24 @@ supabase_send_password_reset <- function(email) {
   req <- request(
     paste0(SUPABASE_URL, "/auth/v1/recover")
   ) |>
+    req_url_query(
+      redirect_to = reset_url
+    ) |>
     req_method("POST") |>
     req_headers(
       apikey = SUPABASE_ANON_KEY,
       Authorization = paste("Bearer", SUPABASE_ANON_KEY)
     ) |>
     req_body_json(list(
-      email = email,
-      redirect_to = reset_url
+      email = email
     ))
   
-  resp <- req_perform(req)
-  
-  list(
-    status = resp_status(resp),
-    body = resp_body_string(resp)
+  resp <- tryCatch(
+    req_perform(req),
+    error = function(e) NULL
   )
+  
+  !is.null(resp) && resp_status(resp) < 400
 }
 
 get_user_profile <- function(user_id) {
