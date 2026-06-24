@@ -97,6 +97,39 @@ supabase_update_password <- function(access_token, new_password) {
   !is.null(resp) && resp_status(resp) < 400
 }
 
+supabase_send_password_reset <- function(email) {
+  
+  reset_url <- paste0(
+    "https://j15vm28ol8.github.io/IEABank_Admin_GUI/reset-password.html"
+  )
+  
+  req <- request(
+    paste0(SUPABASE_URL, "/auth/v1/recover")
+  ) |>
+    req_method("POST") |>
+    req_headers(
+      apikey = SUPABASE_ANON_KEY,
+      Authorization = paste("Bearer", SUPABASE_ANON_KEY),
+      `Content-Type` = "application/json"
+    ) |>
+    req_body_raw(
+      jsonlite::toJSON(
+        list(
+          email = email,
+          redirect_to = reset_url
+        ),
+        auto_unbox = TRUE
+      )
+    )
+  
+  resp <- tryCatch(
+    req_perform(req),
+    error = function(e) NULL
+  )
+  
+  !is.null(resp) && resp_status(resp) < 400
+}
+
 get_user_profile <- function(user_id) {
   dbGetQuery(
     pool,
@@ -328,6 +361,14 @@ login_ui <- function() {
       class = "btn-primary w-100"
     ),
     
+    div(
+      style = "text-align:center; margin-top:14px;",
+      actionLink(
+        "forgot_password_btn",
+        "Forgot password?"
+      )
+    ),
+    
     uiOutput("login_message")
   )
 }
@@ -495,6 +536,57 @@ server <- function(input, output, session) {
       class = "text-danger",
       style = "margin-top:14px; text-align:center;",
       login_error()
+    )
+  })
+  
+  observeEvent(input$forgot_password_btn, {
+    
+    showModal(
+      modalDialog(
+        title = "Reset password",
+        
+        p(
+          "Enter your email address. If it is registered, you will receive a password recovery link."
+        ),
+        
+        textInput(
+          "reset_email",
+          "Email"
+        ),
+        
+        footer = tagList(
+          modalButton("Cancel"),
+          actionButton(
+            "send_reset_btn",
+            "Send recovery email",
+            class = "btn-primary"
+          )
+        ),
+        easyClose = FALSE
+      )
+    )
+  })
+  
+  observeEvent(input$send_reset_btn, {
+    
+    email <- trimws(input$reset_email %||% "")
+    
+    if (!nzchar(email)) {
+      showNotification(
+        "Enter your email address.",
+        type = "error"
+      )
+      return()
+    }
+    
+    supabase_send_password_reset(email)
+    
+    removeModal()
+    
+    showNotification(
+      "If this email address is registered, a password recovery link has been sent.",
+      type = "message",
+      duration = 8
     )
   })
   
