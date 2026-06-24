@@ -99,12 +99,14 @@ supabase_update_password <- function(access_token, new_password) {
 
 supabase_send_password_reset <- function(email) {
   
-  reset_url <- paste0(
-    "https://j15vm28ol8.github.io/IEABank_Admin_GUI/reset-password.html"
-  )
+  reset_url <- "https://j15vm28ol8.github.io/IEABank_Admin_GUI/reset-password.html"
   
   req <- request(
-    paste0(SUPABASE_URL, "/auth/v1/recover")
+    paste0(
+      SUPABASE_URL,
+      "/auth/v1/recover?redirect_to=",
+      utils::URLencode(reset_url, reserved = TRUE)
+    )
   ) |>
     req_method("POST") |>
     req_headers(
@@ -114,10 +116,7 @@ supabase_send_password_reset <- function(email) {
     ) |>
     req_body_raw(
       jsonlite::toJSON(
-        list(
-          email = email,
-          redirect_to = reset_url
-        ),
+        list(email = email),
         auto_unbox = TRUE
       )
     )
